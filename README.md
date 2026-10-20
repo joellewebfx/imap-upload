@@ -4,6 +4,87 @@ _Copyright &copy; 2009-2014 [OZAWA Masayuki](http://coroq.com/) and [Ricardo Gla
 
 IMAP Upload is a tool for uploading a local mbox file to IMAP4 server. The most stable way to migrate to Gmail.
 
+## Migration helpers (local mbox → Gmail)
+
+Wrappers around `imap_upload.py` for large Yahoo→Gmail migrations. Prefer
+**`upload_remaining.sh`** for day-to-day runs: it skips finished folders, retries
+leftovers, and **stops on Gmail `OVERQUOTA`** so you can wait and resume.
+
+Use a Gmail **app password**. Omit `-p` to be prompted.
+
+### Typical flow
+
+```bash
+# After imapgrab has downloaded into downloaded_emails/<account>/
+bash ./upload_remaining.sh \
+  --source /path/to/imapgrab/downloaded_emails/user_example_com \
+  -e "user@example.com"
+```
+
+If you hit `OVERQUOTA` / bandwidth limits, wait (often 1–2 hours or overnight) and
+run the **same** command again. Finished folders are skipped.
+
+### `upload_remaining.sh`
+
+Uploads only what is not done yet:
+
+| Local state | Action |
+|-------------|--------|
+| Empty `Foo.upload-errors.mbox` (or `.done` / `.toobig`) | Skip (already done) |
+| Non-empty `Foo.upload-errors*.mbox` | Retry latest leftovers only |
+| No error file yet | Upload `Foo.mbox` as a new Gmail label |
+
+```bash
+bash ./upload_remaining.sh \
+  --source /path/to/downloaded_emails/user_example_com \
+  -e "user@example.com"
+```
+
+- Maps `Sent` → `[Gmail]/Sent Mail`, `Trash` → `[Gmail]/Trash`, etc.
+- Normalizes trailing / double spaces in Yahoo folder names (avoids Gmail `TRYCREATE`).
+- Exit code **3** = Gmail OVERQUOTA (batch stopped on purpose).
+- Messages over ~25MB fail with `[TOOBIG]`; park leftovers so they are not retried forever:
+
+```bash
+mv "Folder.upload-errors.mbox" "Folder.upload-errors.mbox.toobig"
+```
+
+### `upload_mailboxes.sh`
+
+Uploads a fixed list of common boxes (Inbox, Sent, Archive, …). Useful for small
+accounts; for hundreds of labels use `upload_remaining.sh` instead.
+
+```bash
+bash ./upload_mailboxes.sh --gmail \
+  --source /path/to/downloaded_emails/user_example_com \
+  -e "user@example.com"
+```
+
+### One-off upload with `imap_upload.py`
+
+```bash
+python3 imap_upload.py --gmail --retry 5 \
+  --user "user@example.com" \
+  --box "INBOX" \
+  --error "/path/to/Inbox.upload-errors.mbox" \
+  "/path/to/Inbox.mbox"
+```
+
+```bash
+# Sent → Gmail Sent
+python3 imap_upload.py --gmail --retry 5 \
+  --user "user@example.com" \
+  --box "[Gmail]/Sent Mail" \
+  --error "/path/to/Sent.upload-errors.mbox" \
+  "/path/to/Sent.mbox"
+```
+
+### Notes
+
+- Do not edit wrapper scripts while a long upload is running (bash can mis-read the file mid-run).
+- Re-uploading a full `.mbox` after it was already imported can create duplicates; prefer leftover / `upload_remaining` retries.
+- Future improvement: outer backoff loop on OVERQUOTA / network loss so overnight runs need less babysitting.
+
 ### Features
 
 *   Recursively import mbox sub-folders, currently supports Mac Mail MBOX export folder format.

@@ -457,6 +457,7 @@ def upload(imap, box, src, err, time_fields, google_takeout=False, google_takeou
     p = Progress(len(src), google_takeout=google_takeout, google_takeout_first_label=google_takeout_first_label,
                  google_takeout_label_priority=google_takeout_label_priority,
                  google_takeout_language=google_takeout_language)
+    overquota_streak = 0
     for i, msg in src.iteritems():
         maximumMessageSizeWarning = False
         try:
@@ -473,20 +474,28 @@ def upload(imap, box, src, err, time_fields, google_takeout=False, google_takeou
                     msg_boxes = msg.boxes
                 for i in range(len(msg_boxes)):
                     r, r2 = imap.upload(box, msg.get_delivery_time(time_fields),
-                                        ImapUploadMessage.as_string(msg), msg.flags, msg_boxes[i], 3)
+                                        ImapUploadMessage.as_string(msg), msg.flags, msg_boxes[i])
                     if r != "OK":
                         raise Exception(r2[0]) # FIXME: Should use custom class
             else:
                 r, r2 = imap.upload(box, msg.get_delivery_time(time_fields),
-                                    ImapUploadMessage.as_string(msg), None, None, 3)
+                                    ImapUploadMessage.as_string(msg), None, None)
                 if r != "OK":
                     raise Exception(r2[0]) # FIXME: Should use custom class
 
             p.endOk()
+            overquota_streak = 0
             continue
         except socket.error as e:
+            # Force-drop the dead connection so the next message reconnects
+            # instead of cascading Bad file descriptor on a closed socket.
+            try:
+                imap.close()
+            except Exception:
+                pass
             p.endError("Socket error: " + str(e))
         except Exception as e:
+            err_s = str(e)
             maximumMessageSizeWarning = maximum_size_exceeded_are_warnings and re.search(r'maximum message size exceeded', repr(e))
             if (maximumMessageSizeWarning):
                 if debug:
@@ -498,9 +507,23 @@ def upload(imap, box, src, err, time_fields, google_takeout=False, google_takeou
                     p.endError(traceback.format_exc())
                 else:
                     p.endError(e)
+            if "OVERQUOTA" in err_s:
+                print("OVERQUOTA rate-limit detected; saving remaining msgs and stopping.")
+                if ((err is not None) and (not maximumMessageSizeWarning)):
+                    err.add(msg)
+                    past = False
+                    for k, rest in src.iteritems():
+                        if not past:
+                            if k == i:
+                                past = True
+                            continue
+                        err.add(rest)
+                p.endAll()
+                return -(p.total_count - p.ok_count - p.warning_count or 1)
         if ((err is not None) and (not maximumMessageSizeWarning)):
             err.add(msg)
     p.endAll()
+    return p.total_count - p.ok_count - p.warning_count
 
 
 def recursive_upload(imap, box, src, err, time_fields, email_only_folders, separator, debug=False):
@@ -667,6 +690,14 @@ class IMAPUploader:
                 box_imap_command = '"' + box + '"'
                 self.imap_create(imap_utf7.encode(box_imap_command))
                 return self.imap.append(imap_utf7.encode(box_imap_command), flags, delivery_time, message)
+        except imaplib.IMAP4.error as e:
+            # Do not retry rate limits — each attempt burns more quota.
+            if "OVERQUOTA" in str(e):
+                self.close()
+                raise
+            if retry == 0:
+                raise
+            self.close()
         except (imaplib.IMAP4.abort, socket.error):
             self.close()
             if retry == 0:
@@ -683,13 +714,52 @@ class IMAPUploader:
             if google_takeout_box != "INBOX":
                 try:
                     self.imap_create(imap_utf7.encode(google_takeout_box_imap_command))
-                except:
+                except imaplib.IMAP4.error as e:
+                    if "OVERQUOTA" in str(e):
+                        raise
                     print ("Cannot create box %s" % google_takeout_box)
             i += 1
+
     def imap_create(self, box):
-        if box not in self.created_directories_cache:
-            self.imap.create(box)
-            self.created_directories_cache.append(box)
+        # Never CREATE Gmail special-use folders or INBOX — they already exist
+        # and CREATE burns IMAP quota / returns BAD.
+        box_str = box.decode("utf-8", "replace") if isinstance(box, bytes) else str(box)
+        box_plain = box_str.strip('"')
+        if box_plain.upper() == "INBOX" or box_plain.startswith("[Gmail]/"):
+            return
+        if box in self.created_directories_cache:
+            return
+        # Prefer SELECT to see if it already exists — avoids burning CREATE quota.
+        try:
+            typ, _ = self.imap.select(box, readonly=True)
+            if typ == "OK":
+                self.created_directories_cache.append(box)
+                try:
+                    self.imap.close()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+        try:
+            typ, data = self.imap.create(box)
+            if typ == "OK":
+                self.created_directories_cache.append(box)
+                return
+            err = data[0] if data else b""
+            err_s = err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err)
+            if "OVERQUOTA" in err_s:
+                raise imaplib.IMAP4.error(err_s)
+            # ALREADYEXISTS etc. — treat as present
+            if "EXISTS" in err_s.upper():
+                self.created_directories_cache.append(box)
+        except imaplib.IMAP4.error as e:
+            if "OVERQUOTA" in str(e):
+                raise
+            # Already exists — cache; other failures must not cache or APPEND
+            # will hit TRYCREATE after a silent failed CREATE.
+            if "EXISTS" in str(e).upper():
+                self.created_directories_cache.append(box)
 
     def enable_dry_run(self):
         def dummy_create(a):
@@ -712,17 +782,33 @@ class IMAPUploader:
             self.enable_dry_run()
         self.imap.socket().settimeout(60)
         self.imap.login(self.user, self.password)
-        self.created_directories_cache = []
+        # Keep create-cache across reconnects within a mailbox upload session
+        if not hasattr(self, "_create_cache_initialized"):
+            self.created_directories_cache = []
+            self._create_cache_initialized = True
 
         try:
             self.imap_create(self.box)
+        except imaplib.IMAP4.error as e:
+            if "OVERQUOTA" in str(e):
+                raise
+            print("(create error: )" + str(e))
         except Exception as e:
             print("(create error: )" + str(e))
 
     def close(self):
         if not self.imap:
             return
-        self.imap.shutdown()
+        # shutdown() on an already-dead socket raises EBADF; always clear
+        # self.imap so open() will reconnect on the next message.
+        try:
+            self.imap.logout()
+        except Exception:
+            pass
+        try:
+            self.imap.shutdown()
+        except Exception:
+            pass
         self.imap = None
 
     def list_boxes(self):
@@ -795,8 +881,12 @@ def main(args=None):
                 src = mailbox.mbox(src, create=False)
                 if err:
                     err = mailbox.mbox(err)
-                upload(uploader, options["box"], src, err, time_fields, google_takeout, google_takeout_first_label,
+                upload_errors = upload(uploader, options["box"], src, err, time_fields, google_takeout, google_takeout_first_label,
                        google_takeout_label_priority, google_takeout_box_as_base_folder, google_takeout_language, debug, maximum_size_exceeded_are_warnings)
+                if upload_errors < 0:
+                    return 3  # OVERQUOTA / rate limit
+                if upload_errors > 0:
+                    return 1
             else:
                 recursive_upload(uploader, "", src, err, time_fields, email_only_folders, separator, debug)
 
@@ -813,6 +903,9 @@ def main(args=None):
         return 1
     except imaplib.IMAP4.error as e:
         print("IMAP4 error:", e)
+        # Login / connect OVERQUOTA must abort the batch (same as mid-upload).
+        if "OVERQUOTA" in str(e):
+            return 3
         return 1
     except KeyboardInterrupt as e:
         print("Interrupted")
